@@ -4,7 +4,7 @@ services:
     container_name: banorte_scraper
     ports:
       - "8000:8000"  # <--- Esto expone el puerto
-    environment:
+    env_file:
       - .env
     volumes:
       - ./main.py:/app/main.py
