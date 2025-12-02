@@ -1,0 +1,11 @@
+services:
+  scraper:
+    build: .
+    container_name: banorte_scraper
+    ports:
+      - "8000:8000"  # <--- Esto expone el puerto
+    environment:
+      - .env_file=/app/.env
+    volumes:
+      - ./main.py:/app/main.py
+    restart: unless-stopped
