@@ -1,12 +1,12 @@
 import os
+import re
 import asyncio
-import uvicorn
 
 from fastapi import FastAPI, Security, HTTPException, status
 from fastapi.security import APIKeyHeader
 from playwright.async_api import async_playwright
 
-app = FastAPI()
+app = FastAPI(title="Banorte Scraper", version="1.0.0")
 
 API_KEY_NAME = "x-api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
@@ -24,11 +24,12 @@ ARGS = [
     "--disable-dev-shm-usage",
 ]
 
+
 async def get_api_key(api_key_header_value: str = Security(api_key_header)):
     if not ACTUAL_API_KEY:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error de configuración: API_KEY no encontrada en variables de entorno."
+            detail="Error de configuración: API_KEY no encontrada en variables de entorno.",
         )
 
     if api_key_header_value == ACTUAL_API_KEY:
@@ -36,12 +37,75 @@ async def get_api_key(api_key_header_value: str = Security(api_key_header)):
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="No autorizado: API Key inválida o faltante"
+        detail="No autorizado: API Key inválida o faltante",
     )
+
+
+async def extraer_ventanilla(page) -> tuple[str, str]:
+    # Intento 1: selector principal esperado
+    try:
+        await page.wait_for_selector(
+            "table.table-indicators tbody tr",
+            state="attached",
+            timeout=20000,
+        )
+    except Exception:
+        pass
+
+    # Intento 2: recorrer tablas visibles
+    selectors = [
+        "table.table-indicators tbody tr",
+        "table tbody tr",
+    ]
+
+    for selector in selectors:
+        rows = page.locator(selector)
+        row_count = await rows.count()
+
+        for i in range(row_count):
+            row = rows.nth(i)
+            cols = row.locator("td")
+            cols_count = await cols.count()
+
+            if cols_count >= 3:
+                nombre = (await cols.nth(0).inner_text()).strip().upper()
+                if "VENTANILLA" in nombre:
+                    compra = (await cols.nth(1).inner_text()).strip()
+                    venta = (await cols.nth(2).inner_text()).strip()
+
+                    if compra and venta:
+                        return compra, venta
+
+    # Intento 3: fallback por texto completo
+    body_text = await page.locator("body").inner_text()
+    match = re.search(
+        r"VENTANILLA\s+\$\s*([0-9.,]+)\s+\$\s*([0-9.,]+)",
+        body_text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        compra = f"$ {match.group(1)}"
+        venta = f"$ {match.group(2)}"
+        return compra, venta
+
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="No se encontró la fila VENTANILLA o no fue posible extraer compra/venta.",
+    )
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
 
 @app.get("/", dependencies=[Security(get_api_key)])
 async def obtener_divisas():
     url = "https://www.banorte.com/Indicadores/"
+
+    browser = None
+    context = None
+    page = None
 
     async with SCRAPE_SEMAPHORE:
         try:
@@ -75,41 +139,13 @@ async def obtener_divisas():
                     wait_until="domcontentloaded",
                 )
 
-                # Espera la tabla real, no un id viejo
-                await page.wait_for_selector(
-                    "table.table-indicators tbody tr",
-                    state="attached",
-                    timeout=45000,
-                )
+                await page.wait_for_timeout(5000)
 
-                rows = page.locator("table.table-indicators tbody tr")
-                row_count = await rows.count()
-
-                venta = None
-                compra = None
-
-                for i in range(row_count):
-                    row = rows.nth(i)
-                    cols = row.locator("td")
-                    cols_count = await cols.count()
-
-                    # Solo filas de datos: nombre, compra, venta
-                    if cols_count == 3:
-                        nombre = (await cols.nth(0).inner_text()).strip().upper()
-                        if nombre == "VENTANILLA":
-                            compra = (await cols.nth(1).inner_text()).strip()
-                            venta = (await cols.nth(2).inner_text()).strip()
-                            break
-
-                if not venta:
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail="No se encontró la fila VENTANILLA o la columna de venta."
-                    )
+                compra, venta = await extraer_ventanilla(page)
 
                 return {
                     "tipo-cambio-compra-banorte": compra,
-                    "tipo-cambio-venta-banorte": venta
+                    "tipo-cambio-venta-banorte": venta,
                 }
 
         except HTTPException:
@@ -118,5 +154,23 @@ async def obtener_divisas():
             print(f"❌ Error en scraper: {e}", flush=True)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Error consultando Banorte: {str(e)}"
+                detail=f"Error consultando Banorte: {str(e)}",
             )
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as e:
+                    print(f"⚠️ Error cerrando page: {e}", flush=True)
+
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception as e:
+                    print(f"⚠️ Error cerrando context: {e}", flush=True)
+
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception as e:
+                    print(f"⚠️ Error cerrando browser: {e}", flush=True)
