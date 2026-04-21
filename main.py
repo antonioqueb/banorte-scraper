@@ -4,7 +4,7 @@ import uvicorn
 
 from fastapi import FastAPI, Security, HTTPException, status
 from fastapi.security import APIKeyHeader
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright
 
 app = FastAPI()
 
@@ -12,8 +12,6 @@ API_KEY_NAME = "x-api-key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 ACTUAL_API_KEY = os.getenv("API_KEY")
 
-# Limita cuántos scrapers corren al mismo tiempo.
-# Si quieres uno por uno, deja 1. Si quieres algo más flexible, usa 2.
 SCRAPE_SEMAPHORE = asyncio.Semaphore(1)
 
 ARGS = [
@@ -26,15 +24,15 @@ ARGS = [
     "--disable-dev-shm-usage",
 ]
 
-async def get_api_key(api_key_header: str = Security(api_key_header)):
+async def get_api_key(api_key_header_value: str = Security(api_key_header)):
     if not ACTUAL_API_KEY:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error de configuración: API_KEY no encontrada en variables de entorno."
         )
 
-    if api_key_header == ACTUAL_API_KEY:
-        return api_key_header
+    if api_key_header_value == ACTUAL_API_KEY:
+        return api_key_header_value
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
@@ -43,11 +41,7 @@ async def get_api_key(api_key_header: str = Security(api_key_header)):
 
 @app.get("/", dependencies=[Security(get_api_key)])
 async def obtener_divisas():
-    url = "https://www.banorte.com/wps/portal/banorte/Home/indicadores/dolares-y-divisas"
-
-    browser: Browser | None = None
-    context: BrowserContext | None = None
-    page: Page | None = None
+    url = "https://www.banorte.com/Indicadores/"
 
     async with SCRAPE_SEMAPHORE:
         try:
@@ -77,35 +71,44 @@ async def obtener_divisas():
 
                 await page.goto(
                     url,
-                    timeout=60000,
+                    timeout=90000,
                     wait_until="domcontentloaded",
                 )
 
+                # Espera la tabla real, no un id viejo
                 await page.wait_for_selector(
-                    "#dolarVenta",
+                    "table.table-indicators tbody tr",
                     state="attached",
-                    timeout=30000,
+                    timeout=45000,
                 )
 
-                await page.wait_for_function(
-                    """
-                    () => {
-                        const el = document.querySelector('#dolarVenta');
-                        return el && el.innerText.trim().length > 0;
-                    }
-                    """,
-                    timeout=15000,
-                )
+                rows = page.locator("table.table-indicators tbody tr")
+                row_count = await rows.count()
 
-                venta = (await page.inner_text("#dolarVenta")).strip()
+                venta = None
+                compra = None
+
+                for i in range(row_count):
+                    row = rows.nth(i)
+                    cols = row.locator("td")
+                    cols_count = await cols.count()
+
+                    # Solo filas de datos: nombre, compra, venta
+                    if cols_count == 3:
+                        nombre = (await cols.nth(0).inner_text()).strip().upper()
+                        if nombre == "VENTANILLA":
+                            compra = (await cols.nth(1).inner_text()).strip()
+                            venta = (await cols.nth(2).inner_text()).strip()
+                            break
 
                 if not venta:
                     raise HTTPException(
                         status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail="No se pudo obtener el valor de venta."
+                        detail="No se encontró la fila VENTANILLA o la columna de venta."
                     )
 
                 return {
+                    "tipo-cambio-compra-banorte": compra,
                     "tipo-cambio-venta-banorte": venta
                 }
 
@@ -114,28 +117,6 @@ async def obtener_divisas():
         except Exception as e:
             print(f"❌ Error en scraper: {e}", flush=True)
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Error consultando Banorte: {str(e)}"
             )
-        finally:
-            # Cierra en orden inverso al de creación
-            if page is not None:
-                try:
-                    await page.close()
-                except Exception as e:
-                    print(f"⚠️ Error cerrando page: {e}", flush=True)
-
-            if context is not None:
-                try:
-                    await context.close()
-                except Exception as e:
-                    print(f"⚠️ Error cerrando context: {e}", flush=True)
-
-            if browser is not None:
-                try:
-                    await browser.close()
-                except Exception as e:
-                    print(f"⚠️ Error cerrando browser: {e}", flush=True)
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
